@@ -413,6 +413,12 @@ svc_fd_ncreatef(const int fd, const u_int sendsize, const u_int recvsize,
 	return (xprt);
 }
 
+static in_port_t svc_get_port(const struct sockaddr_storage* addr)
+{
+    const struct sockaddr_in *sock_addr = (const struct sockaddr_in*)addr;
+    return sock_addr->sin_port;
+}
+
  /*ARGSUSED*/
 static enum xprt_stat
 svc_vc_rendezvous(SVCXPRT *xprt)
