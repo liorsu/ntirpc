@@ -163,8 +163,12 @@ svc_xprt_lookup(int fd, svc_xprt_setup_t setup)
 	nv = opr_rbtree_lookup(&t->t, &sk.fd_node);
 	if (!nv) {
 		rwlock_unlock(&t->lock);
-		if (!setup)
+		if (!setup) {
+			__warnx(TIRPC_DEBUG_FLAG_SVC_XPRT,
+				"%s: fd %d not found - return NULL",
+				__func__, fd);
 			return (NULL);
+		}
 
 		rwlock_wrlock(&t->lock);
 		nv = opr_rbtree_lookup(&t->t, &sk.fd_node);
@@ -174,7 +178,7 @@ svc_xprt_lookup(int fd, svc_xprt_setup_t setup)
 				atomic_dec_uint32_t(&svc_xprt_fd.connections);
 				rwlock_unlock(&t->lock);
 				__warnx(TIRPC_DEBUG_FLAG_ERROR,
-					"%s: fd %d max_connections %u exceeded\n",
+					"%s: fd %d max_connections %u exceeded",
 					__func__, fd,
 					__svc_params->max_connections);
 				return (NULL);
@@ -207,6 +211,12 @@ svc_xprt_lookup(int fd, svc_xprt_setup_t setup)
 	rec = opr_containerof(nv, struct rpc_dplx_rec, fd_node);
 	xprt = &rec->xprt;
 
+	if (setup) {
+		__warnx(TIRPC_DEBUG_FLAG_WARN,
+			"%s: fd %d xprt %p found, though expected new",
+			__func__, fd, xprt);
+	}
+
 	/* lookup reference before unlock ensures shutdown cannot release */
 	SVC_REF(xprt, SVC_REF_FLAG_NONE);
 	rwlock_unlock(&t->lock);
@@ -227,6 +237,9 @@ svc_xprt_lookup(int fd, svc_xprt_setup_t setup)
 	}
 
 	/* unlock before release permits releasing here after destroy */
+	__warnx(TIRPC_DEBUG_FLAG_ERROR,
+		"%s: fd %d found DESTROYED xprt %p - calling RELEASE",
+		__func__, fd, xprt);
 	SVC_RELEASE(xprt, SVC_RELEASE_FLAG_NONE);
 	return (NULL);
 }

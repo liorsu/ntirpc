@@ -473,15 +473,20 @@ svc_vc_rendezvous(SVCXPRT *xprt)
 	 */
 	newxprt = makefd_xprt(fd, req_xd->sx_dr.sendsz, req_xd->sx_dr.recvsz,
 			      &si, SVC_XPRT_FLAG_CLOSE);
-	if ((!newxprt) || (!(newxprt->xp_flags & SVC_XPRT_FLAG_INITIAL))) {
-
-		if (newxprt) {
-			SVC_DESTROY(newxprt);
-			/* Was never added to epoll */
-			SVC_RELEASE(newxprt, SVC_RELEASE_FLAG_NONE);
-		} else {
-			close(fd);
-		}
+	if (unlikely(!newxprt)) {
+		__warnx(TIRPC_DEBUG_FLAG_WARN,
+			"%s: listen fd %d of %p failed for %d, close fd",
+			__func__, xprt->xp_fd, xprt, fd);
+		close(fd);
+		return (XPRT_DIED);
+	}
+	if (unlikely(!(newxprt->xp_flags & SVC_XPRT_FLAG_INITIAL))) {
+		__warnx(TIRPC_DEBUG_FLAG_ERROR,
+			"%s: %p fd %d with xp_refcnt %" PRId32 ", failed (will set dead)",
+			__func__, newxprt, newxprt->xp_fd, newxprt->xp_refcnt);
+		SVC_DESTROY(newxprt);
+		/* Was never added to epoll */
+		SVC_RELEASE(newxprt, SVC_RELEASE_FLAG_NONE);
 		return (XPRT_DIED);
 	}
 
@@ -557,6 +562,12 @@ svc_vc_rendezvous(SVCXPRT *xprt)
 	return (XPRT_IDLE);
 }
 
+// This can be overridden in tests.
+__attribute__((weak)) void svc_vc_notify_xprt_destroy_for_testing(
+	const struct sockaddr_storage *remote_address)
+{
+}
+
 static void
 svc_vc_destroy_task(struct work_pool_entry *wpe)
 {
@@ -583,6 +594,11 @@ svc_vc_destroy_task(struct work_pool_entry *wpe)
 
 	xp_flags = atomic_postclear_uint16_t_bits(&rec->xprt.xp_flags,
 						  SVC_XPRT_FLAG_CLOSE);
+	__warnx(TIRPC_DEBUG_FLAG_REFCNT,
+		"%s() xprt: %p fd %d xp_refcnt %" PRId32 ", DESTROYING=%d RELEASING=%d",
+		__func__, &rec->xprt, rec->xprt.xp_fd, xp_refcnt,
+		((xp_flags & SVC_XPRT_FLAG_DESTROYING) !=  0),
+		((xp_flags & SVC_XPRT_FLAG_RELEASING) != 0));
 	close_fd = ((xp_flags & SVC_XPRT_FLAG_CLOSE) &&
 		rec->xprt.xp_fd != RPC_ANYFD);
 	if (close_fd) {
@@ -594,6 +610,10 @@ svc_vc_destroy_task(struct work_pool_entry *wpe)
 			 __func__, rec->xprt.xp_fd);
 		if (rec->xprt.xp_fd_send != RPC_ANYFD)
 			(void)shutdown(rec->xprt.xp_fd_send, SHUT_RDWR);
+	} else {
+		__warnx(TIRPC_DEBUG_FLAG_SVC_VC,
+			"%s: called for xprt %p, no close_fd, fd %d flags %x",
+			 __func__, &rec->xprt, rec->xprt.xp_fd, xp_flags);
 	}
 
 	if (rec->xprt.xp_ops->xp_free_user_data)
@@ -604,8 +624,14 @@ svc_vc_destroy_task(struct work_pool_entry *wpe)
 	 * there are no references left to this XPRT. */
 	if (close_fd) {
 		__warnx(TIRPC_DEBUG_FLAG_SVC_VC,
-			"%s: fd %d close",
-			 __func__, rec->xprt.xp_fd);
+			"%s: fd %d xprt %p: fd close",
+			__func__, rec->xprt.xp_fd, &rec->xprt);
+		if (rec->xprt.xp_refcnt > 0) {
+			__warnx(TIRPC_DEBUG_FLAG_ERROR,
+				"%s: fd %d before close has ref_count %" PRId32,
+				 __func__, rec->xprt.xp_fd, rec->xprt.xp_refcnt);
+			assert(false);
+		}
 		(void)close(rec->xprt.xp_fd);
 		rec->xprt.xp_fd = RPC_ANYFD;
 		if (rec->xprt.xp_fd_send != RPC_ANYFD) {
@@ -622,12 +648,17 @@ svc_vc_destroy_task(struct work_pool_entry *wpe)
 	if (rec->xprt.xp_parent)
 		SVC_RELEASE(rec->xprt.xp_parent, SVC_RELEASE_FLAG_NONE);
 
+	const struct sockaddr_storage remote_address = rec->xprt.xp_remote.ss;
 	svc_vc_xprt_free(VC_DR(rec));
+	svc_vc_notify_xprt_destroy_for_testing(&remote_address);
 }
 
 static void
 svc_vc_unlink_it(SVCXPRT *xprt, u_int flags, const char *tag, const int line)
 {
+	__warnx(TIRPC_DEBUG_FLAG_REFCNT,
+		"%s() %p fd %d xp_refcnt %" PRId32 " @%s:%d",
+		__func__, xprt, xprt->xp_fd, xprt->xp_refcnt, tag, line);
 	svc_rqst_xprt_unregister(xprt, flags);
 }
 
