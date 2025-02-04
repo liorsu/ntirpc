@@ -179,6 +179,7 @@ typedef struct svc_init_params {
 #define SVC_XPRT_TREE_LOCKED		0x0100
 #define SVC_XPRT_FLAG_REMOTE_ADDR_SET	0x0200	/* remote addr was final set */
 #define SVC_XPRT_FLAG_READY		0x0400	/* ready to use */
+#define SVC_XPRT_FLAG_IOQ_WRITING	0x0800	/* xprt is used by svc_ioq_write */
 
 #define SVC_XPRT_FLAG_DESTROYED (SVC_XPRT_FLAG_DESTROYING \
 				| SVC_XPRT_FLAG_RELEASING)
@@ -312,6 +313,7 @@ struct svc_xprt {
 
 	int32_t xp_refcnt;	/* handle reference count */
 	uint16_t xp_flags;	/* flags */
+	uint32_t xp_unique_id;
 
 	union {
 		struct in_pktinfo in;
@@ -532,7 +534,7 @@ static inline void svc_destroy_it(SVCXPRT *xprt,
 
 	XPRT_TRACE(xprt, __func__, tag, line);
 
-	XPRT_AUTO_TRACEPOINT(xprt, destroy_it, TRACE_DEBUG, "Destroy XPRT");
+	XPRT_AUTO_TRACEPOINT(xprt, destroy_it, TRACE_INFO, "Destroy XPRT");
 
 	if (flags & SVC_XPRT_FLAG_DESTROYING) {
 		/* previously set, do nothing */

@@ -33,6 +33,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <assert.h>
 
 #include <rpc/types.h>
 #include <misc/portable.h>
@@ -75,6 +76,23 @@
 /* > RPC_DPLX_LOCKED > SVC_XPRT_FLAG_LOCKED */
 #define SVC_RQST_LOCKED		0x01000000
 #define SVC_RQST_UNLOCK		0x02000000
+
+/* svc_epoll_data is used as the data for svc fd event in epoll.
+ * It enables a direct access to the fd and unique_id, and to
+ * serialize/deserialize the struct into the event format.
+ */
+union svc_epoll_data {
+	struct {
+		int fd;
+		uint32_t unique_id;
+	} data;
+	uint64_t serialized_data;
+};
+
+static_assert(sizeof(union svc_epoll_data) == sizeof(union epoll_data),
+		"incorrect size for svc_epoll_data");
+
+#define SVC_NO_XPRT_UNIQUE_ID	0
 
 static uint32_t round_robin;
 /*static*/ uint32_t wakeups;
@@ -394,6 +412,7 @@ svc_rqst_new_evchan(uint32_t *chan_id /* OUT */, void *u_data, uint32_t flags)
 	int code = 0, i;
 	work_pool_fun_t fun = NULL;
 	int32_t ref_rec;
+	union svc_epoll_data ev_data;
 
 	mutex_lock(&svc_rqst_set.mtx);
 	if (!svc_rqst_set.next_id) {
@@ -466,7 +485,10 @@ svc_rqst_new_evchan(uint32_t *chan_id /* OUT */, void *u_data, uint32_t flags)
 		/* permit wakeup of threads blocked in epoll_wait, with a
 		 * couple of possible semantics */
 		sr_rec->ev_u.epoll.ctrl_ev.events = EPOLLIN | EPOLLRDHUP;
-		sr_rec->ev_u.epoll.ctrl_ev.data.fd = sr_rec->sv[1];
+		ev_data.data.fd = sr_rec->sv[1];
+		/* channel event has no xprt unique id */
+		ev_data.data.unique_id = SVC_NO_XPRT_UNIQUE_ID;
+		sr_rec->ev_u.epoll.ctrl_ev.data.u64 = ev_data.serialized_data;
 		code = epoll_ctl(sr_rec->ev_u.epoll.epoll_fd, EPOLL_CTL_ADD,
 				 sr_rec->sv[1], &sr_rec->ev_u.epoll.ctrl_ev);
 		if (code == -1) {
@@ -717,7 +739,6 @@ svc_rqst_rearm_events_locked(SVCXPRT *xprt, uint16_t ev_flags)
 					sr_rec, sr_rec->id_k, sr_rec->ev_refcnt,
 					sr_rec->ev_u.epoll.epoll_fd,
 					sr_rec->sv[0], sr_rec->sv[1], code);
-				SVC_RELEASE(xprt, SVC_RELEASE_FLAG_NONE);
 			} else {
 				__warnx(TIRPC_DEBUG_FLAG_SVC_RQST |
 					TIRPC_DEBUG_FLAG_REFCNT,
@@ -757,7 +778,6 @@ svc_rqst_rearm_events_locked(SVCXPRT *xprt, uint16_t ev_flags)
 					sr_rec, sr_rec->id_k, sr_rec->ev_refcnt,
 					sr_rec->ev_u.epoll.epoll_fd,
 					sr_rec->sv[0], sr_rec->sv[1], code);
-				SVC_RELEASE(xprt, SVC_RELEASE_FLAG_NONE);
 			} else {
 				__warnx(TIRPC_DEBUG_FLAG_SVC_RQST |
 					TIRPC_DEBUG_FLAG_REFCNT,
@@ -791,6 +811,9 @@ svc_rqst_hook_events(struct rpc_dplx_rec *rec, struct svc_rqst_rec *sr_rec,
 		     uint16_t ev_flags)
 {
 	int code = EINVAL;
+	const union svc_epoll_data ev_data = {
+			.data.fd = rec->xprt.xp_fd,
+			.data.unique_id = rec->xprt.xp_unique_id};
 
 	XPRT_AUTO_TRACEPOINT(&rec->xprt, hook, TRACE_DEBUG,
 		"Hook. ev_flags: {}", ev_flags);
@@ -827,7 +850,7 @@ svc_rqst_hook_events(struct rpc_dplx_rec *rec, struct svc_rqst_rec *sr_rec,
 			ev = &rec->ev_u.epoll.event_recv;
 
 			/* set up epoll user data */
-			ev->data.fd = rec->xprt.xp_fd;
+			ev->data.u64 = ev_data.serialized_data;
 
 			/* wait for read events, level triggered, oneshot */
 			ev->events = EPOLLONESHOT | EPOLLIN;
@@ -867,7 +890,7 @@ svc_rqst_hook_events(struct rpc_dplx_rec *rec, struct svc_rqst_rec *sr_rec,
 			ev = &rec->ev_u.epoll.event_send;
 
 			/* set up epoll user data.  Lookup needs the primary FD */
-			ev->data.fd = rec->xprt.xp_fd;
+			ev->data.u64 = ev_data.serialized_data;
 
 			/* wait for write events, edge triggered, oneshot */
 			ev->events = EPOLLONESHOT | EPOLLOUT | EPOLLET;
@@ -1142,6 +1165,51 @@ svc_rqst_xprt_register(SVCXPRT *newxprt, SVCXPRT *xprt)
 	return svc_rqst_evchan_reg(sr_rec->id_k, newxprt, SVC_RQST_FLAG_NONE);
 }
 
+
+/*
+ *  need to clear these requests as they are waiting for epoll, which will
+ *   never be triggered after destroy as it unregisters all events
+ */
+static void clear_requests(struct rpc_dplx_rec *rec) {
+	struct poolq_entry *have;
+	struct xdr_ioq *xioq;
+	struct timespec ts = {
+		.tv_sec = 0,
+		.tv_nsec = 0,
+	};
+
+	while (atomic_postset_uint16_t_bits(&rec->xprt.xp_flags,
+			SVC_XPRT_FLAG_IOQ_WRITING)
+	       & SVC_XPRT_FLAG_IOQ_WRITING) {
+		nanosleep(&ts, NULL);
+		XPRT_UNIQUE_AUTO_TRACEPOINT(&rec->xprt, ioq_clearing, TRACE_INFO,
+			"xprt is being transmitted by another thread, can't clear");
+	}
+
+	int release_count = 0;
+	mutex_lock(&rec->writeq.qmutex);
+	have = TAILQ_FIRST(&rec->writeq.qh);
+	while(have != NULL) {
+		xioq = _IOQ(have);
+		while (atomic_postset_uint16_t_bits(&(xioq->ioq_s.qflags),
+						    IOQ_FLAG_WORKING)
+		       & IOQ_FLAG_WORKING) {
+			nanosleep(&ts, NULL);
+			/* We can't clear request when it is in work pool */
+		}
+
+		release_count++;
+		TAILQ_REMOVE(&rec->writeq.qh, have, q);
+		XDR_DESTROY(xioq->xdrs);
+		have = TAILQ_FIRST(&rec->writeq.qh);
+	}
+	mutex_unlock(&rec->writeq.qmutex);
+
+	for(int i = 0; i < release_count; i++) {
+		SVC_RELEASE(&rec->xprt, SVC_RELEASE_FLAG_NONE);
+	}
+}
+
 /*
  * flags indicate locking state
  *
@@ -1171,6 +1239,7 @@ svc_rqst_xprt_unregister(SVCXPRT *xprt, uint32_t flags)
 		return;
 	}
 	svc_rqst_unreg(rec, sr_rec);
+	clear_requests(rec);
 }
 
 #if defined(USE_RPC_RDMA)
@@ -1395,8 +1464,9 @@ svc_rqst_epoll_event(struct svc_rqst_rec *sr_rec, struct epoll_event *ev)
 	uint16_t xp_flags, ev_flag = 0;
 	struct xdr_ioq *ioq = NULL;
 	work_pool_fun_t fun;
+	const union svc_epoll_data ev_data = {.serialized_data = ev->data.u64};
 
-	if (unlikely(ev->data.fd == sr_rec->sv[1])) {
+	if (unlikely(ev_data.data.fd == sr_rec->sv[1])) {
 		/* signalled -- there was a wakeup on ctrl_ev (see
 		 * top-of-loop) */
 		__warnx(TIRPC_DEBUG_FLAG_SVC_RQST,
@@ -1411,14 +1481,31 @@ svc_rqst_epoll_event(struct svc_rqst_rec *sr_rec, struct epoll_event *ev)
 		return (NULL);
 	}
 
-	xprt = svc_xprt_lookup(ev->data.fd, NULL);
+	xprt = svc_xprt_lookup(ev_data.data.fd, NULL);
 	if (!xprt) {
+		NTIRPC_AUTO_TRACEPOINT(xprt, epoll_fail_lookup, TRACE_INFO,
+				"no xprt found fd = {}", ev_data.data.fd);
 		__warnx(TIRPC_DEBUG_FLAG_SVC_RQST,
 			"%s: fd %d no associated xprt",
-			__func__, ev->data.fd);
+			__func__, ev_data.data.fd);
 		return (NULL);
 	}
 	/* At this point, we have a ref on the xprt, and know it's valid */
+	/* verify that indeed this is the xprt as of the event. */
+	if (ev_data.data.unique_id != xprt->xp_unique_id) {
+		NTIRPC_AUTO_TRACEPOINT(xprt, unique_id_mismatch, TRACE_INFO,
+				"xprt for fd = {} found with unique_id = {}, but event unique_id = {}",
+				ev_data.data.fd, xprt->xp_unique_id,
+				ev_data.data.unique_id);
+		__warnx(TIRPC_DEBUG_FLAG_ERROR,
+			"%s: event fd %d with xp_unique_id %" PRIu32
+			" differs from of xp_unique_id %" PRIu32 " of xprt %p. Release and ignore",
+			__func__, ev_data.data.fd, ev_data.data.unique_id,
+			xprt->xp_unique_id, xprt);
+		SVC_RELEASE(xprt, SVC_RELEASE_FLAG_NONE);
+		return (NULL);
+	}
+
 	rec = REC_XPRT(xprt);
 
 	__warnx(TIRPC_DEBUG_FLAG_SVC_RQST,
@@ -1439,6 +1526,8 @@ svc_rqst_epoll_event(struct svc_rqst_rec *sr_rec, struct epoll_event *ev)
 		ioq = rec->ev_u.epoll.xioq_send;
 		fun = svc_rqst_xprt_task_send;
 	} else {
+		XPRT_UNIQUE_AUTO_TRACEPOINT(&rec->xprt, epoll_event, TRACE_INFO,
+			"Unhandled epoll event. ev_flag: {}", ev->events);
 		/* This is some other event... */
 		SVC_RELEASE(&rec->xprt, SVC_RELEASE_FLAG_NONE);
 		return NULL;
@@ -1460,7 +1549,7 @@ svc_rqst_epoll_event(struct svc_rqst_rec *sr_rec, struct epoll_event *ev)
 		ev_flag & SVC_XPRT_FLAG_ADDED_RECV ? " ADDED_RECV" : "",
 		ev_flag & SVC_XPRT_FLAG_ADDED_SEND ? " ADDED_SEND" : "");
 
-	XPRT_AUTO_TRACEPOINT(&rec->xprt, epoll_event, TRACE_DEBUG,
+	XPRT_UNIQUE_AUTO_TRACEPOINT(&rec->xprt, epoll_event, TRACE_DEBUG,
 		"Epoll event. ev_flag: {}", ev_flag);
 
 	if (rec->xprt.xp_refcnt > 1
@@ -1476,7 +1565,8 @@ svc_rqst_epoll_event(struct svc_rqst_rec *sr_rec, struct epoll_event *ev)
 		ioq->rec = rec;
 		return ioq;
 	}
-
+	XPRT_UNIQUE_AUTO_TRACEPOINT(&rec->xprt, epoll_event, TRACE_INFO,
+		"irrelevant epoll event. ev_flag: {}", ev_flag);
 	/* Do not return destroyed transports.
 	 * Probably log non-fatal "WARNING! already destroying!"
 	 */
