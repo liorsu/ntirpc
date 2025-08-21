@@ -370,8 +370,9 @@ void metrics_libntirpc_update_tcp_connection_count(int connection_count)
 
 void metrics_libntirpc_init(void)
 {
+	if (initialized)
+		return;
 	const metric_label_t empty_labels[] = {};
-	assert(initialized == false);
 	concurrent_tcp_metric = monitoring__register_gauge(
 		"libntirpc__tcp_connections_count",
 		METRIC_METADATA("TCP connections count", METRIC_UNIT_NONE),
